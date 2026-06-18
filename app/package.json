@@ -1,0 +1,22 @@
+{
+  "name": "hello-world-azure",
+  "version": "1.0.0",
+  "description": "Hello World app for Azure CI/CD POC",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "test": "jest --coverage",
+    "lint": "echo 'No linter configured yet. Add ESLint for production.'"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
+  },
+  "devDependencies": {
+    "jest": "^29.7.0",
+    "jest-junit": "^16.0.0",
+    "supertest": "^7.0.0"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}

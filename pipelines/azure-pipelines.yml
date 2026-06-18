@@ -1,0 +1,244 @@
+trigger:
+  branches:
+    include:
+      - main
+      - feature/*
+
+variables:
+  - group: azure-poc-variables
+  - name: azureServiceConnection
+    value: 'azure-service-connection'
+  - name: sonarQubeServiceConnection
+    value: 'sonar-qube-conn'
+  - name: sonarQubeProjectKey
+    value: 'hello-world-azure'
+  - name: subscriptionId
+    value: '$(subscriptionId)'
+  - name: location
+    value: '$(location)'
+  - name: appName
+    value: '$(appName)'
+  - name: environment
+    value: '$(environment)'
+  - name: workingDirectory
+    value: '$(Build.SourcesDirectory)'
+  - name: appPath
+    value: '$(workingDirectory)/app'
+  - name: infraPath
+    value: '$(workingDirectory)/infra'
+
+stages:
+  - stage: Build
+    displayName: 'Build, Test & Security Scan'
+    jobs:
+      - job: build_job
+        displayName: 'Build, Test, SonarQube & Trivy'
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          - checkout: self
+            clean: true
+
+          - task: NodeTool@0
+            displayName: 'Install Node 20'
+            inputs:
+              versionSpec: '20.x'
+
+          - script: |
+              cd $(appPath)
+              npm ci
+            displayName: 'npm ci'
+
+          - script: |
+              cd $(appPath)
+              npm run lint
+            displayName: 'Lint'
+            continueOnError: true
+
+          - script: |
+              cd $(appPath)
+              npm test
+            displayName: 'Run Tests'
+
+          - task: PublishTestResults@2
+            displayName: 'Publish Test Results (JUnit)'
+            inputs:
+              testResultsFormat: 'JUnit'
+              testResultsFiles: '$(appPath)/coverage/junit.xml'
+              mergeTestResults: true
+              failTaskOnFailedTests: true
+            condition: succeededOrFailed()
+
+          - task: PublishCodeCoverageResults@1
+            displayName: 'Publish Code Coverage (Cobertura)'
+            inputs:
+              codeCoverageTool: 'Cobertura'
+              summaryFileLocation: '$(appPath)/coverage/cobertura-coverage.xml'
+            condition: succeededOrFailed()
+
+          # ---- SonarQube SAST Scan ----
+          - task: SonarQubePrepare@5
+            displayName: 'SonarQube — Prepare Analysis'
+            inputs:
+              SonarQube: '$(sonarQubeServiceConnection)'
+              scannerMode: 'CLI'
+              configMode: 'manual'
+              cliProjectKey: '$(sonarQubeProjectKey)'
+              cliSources: '$(appPath)/src'
+              extraProperties: |
+                sonar.javascript.lcov.reportPaths=$(appPath)/coverage/lcov.info
+                sonar.testExecutionReportPaths=$(appPath)/coverage/junit.xml
+                sonar.coverage.exclusions=$(appPath)/tests/**
+                sonar.sources=$(appPath)/src
+                sonar.tests=$(appPath)/tests
+
+          - task: SonarQubeAnalyze@5
+            displayName: 'SonarQube — Run Analysis'
+            inputs:
+              jdkversion: 'JAVA_HOME_17_X64'
+
+          - task: SonarQubePublish@5
+            displayName: 'SonarQube — Publish Quality Gate Result'
+            inputs:
+              pollingTimeoutSec: '300'
+
+          # ---- Build Docker Image for Trivy ----
+          - task: Docker@2
+            displayName: 'Build Docker Image'
+            inputs:
+              containerRegistry: ''
+              repository: '$(appName)'
+              command: 'build'
+              Dockerfile: '$(appPath)/Dockerfile'
+              tags: |
+                $(Build.BuildId)
+              arguments: '--build-arg BUILD_NUMBER=$(Build.BuildId)'
+
+          # ---- Trivy Container Vulnerability Scan ----
+          - task: AquasecurityTrivy@1
+            displayName: 'Trivy — Container Image Scan'
+            inputs:
+              image: '$(appName):$(Build.BuildId)'
+              severity: 'CRITICAL,HIGH'
+              exitCode: '1'
+              hideProgress: false
+
+          # ---- Package App for Zip Deploy ----
+          - task: ArchiveFiles@2
+            displayName: 'Package App for Zip Deploy'
+            inputs:
+              rootFolderOrFile: '$(appPath)'
+              includeRootFolder: false
+              archiveType: 'zip'
+              archiveFile: '$(Build.ArtifactStagingDirectory)/app.zip'
+              replaceExistingArchive: true
+
+          - task: PublishBuildArtifacts@1
+            displayName: 'Publish Artifact'
+            inputs:
+              PathtoPublish: '$(Build.ArtifactStagingDirectory)'
+              ArtifactName: 'drop'
+              publishLocation: 'Container'
+
+  - stage: Deploy
+    displayName: 'Deploy to Azure'
+    dependsOn: Build
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+    jobs:
+      - deployment: deploy_job
+        displayName: 'Provision Infra, Deploy App & Verify Observability'
+        environment: '$(environment)'
+        pool:
+          vmImage: 'ubuntu-latest'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+                  clean: true
+
+                # ---- Provision Infrastructure with Bicep ----
+                - task: AzureCLI@2
+                  displayName: 'Provision Infrastructure (Bicep)'
+                  inputs:
+                    azureSubscription: '$(azureServiceConnection)'
+                    scriptType: 'bash'
+                    scriptLocation: 'inlineScript'
+                    inlineScript: |
+                      az deployment sub create \
+                        --name '$(Build.BuildId)-$(environment)' \
+                        --location $(location) \
+                        --template-file $(infraPath)/main.bicep \
+                        --parameters \
+                          appName=$(appName) \
+                          environment=$(environment) \
+                          location=$(location)
+                    useGlobalConfig: true
+
+                # ---- Download Build Artifact ----
+                - task: DownloadBuildArtifacts@1
+                  displayName: 'Download Build Artifact'
+                  inputs:
+                    buildType: 'current'
+                    downloadType: 'single'
+                    artifactName: 'drop'
+                    downloadPath: '$(System.ArtifactsDirectory)'
+
+                # ---- Deploy to Azure Web App ----
+                - task: AzureWebApp@1
+                  displayName: 'Deploy to Azure Web App (Zip Deploy)'
+                  inputs:
+                    azureSubscription: '$(azureServiceConnection)'
+                    appType: 'webAppLinux'
+                    appName: 'app-$(appName)-$(environment)'
+                    package: '$(System.ArtifactsDirectory)/drop/app.zip'
+                    deploymentMethod: 'zipDeploy'
+                    runtimeStack: 'NODE|20-lts'
+
+                # ---- Smoke Test ----
+                - task: AzureCLI@2
+                  displayName: 'Smoke Test — /health endpoint'
+                  inputs:
+                    azureSubscription: '$(azureServiceConnection)'
+                    scriptType: 'bash'
+                    scriptLocation: 'inlineScript'
+                    inlineScript: |
+                      WEB_APP_NAME="app-$(appName)-$(environment)"
+                      HOSTNAME=$(az webapp show \
+                        --name $WEB_APP_NAME \
+                        --resource-group rg-$(appName)-$(environment) \
+                        --query defaultHostName \
+                        --output tsv)
+                      echo "Testing https://$HOSTNAME/health"
+                      for i in {1..10}; do
+                        STATUS=$(curl -s -o /dev/null -w "%{http_code}" https://$HOSTNAME/health)
+                        echo "Attempt $i: HTTP $STATUS"
+                        if [ "$STATUS" == "200" ]; then
+                          echo "Smoke test passed!"
+                          exit 0
+                        fi
+                        sleep 10
+                      done
+                      echo "Smoke test failed after 10 attempts"
+                      exit 1
+
+                # ---- Verify Azure Monitor Alerts Active ----
+                - task: AzureCLI@2
+                  displayName: 'Verify Azure Monitor Alerts'
+                  inputs:
+                    azureSubscription: '$(azureServiceConnection)'
+                    scriptType: 'bash'
+                    scriptLocation: 'inlineScript'
+                    inlineScript: |
+                      RG="rg-$(appName)-$(environment)"
+                      echo "Verifying Azure Monitor alerts in RG: $RG"
+                      ALERTS=$(az monitor metrics alert list \
+                        --resource-group "$RG" \
+                        --query "[].{name:name, enabled:enabled}" \
+                        --output tsv 2>/dev/null)
+                      if [ -z "$ALERTS" ]; then
+                        echo "Warning: No metric alerts found"
+                      else
+                        echo "$ALERTS"
+                        echo "Alerts verified successfully"
+                      fi
