@@ -59,9 +59,8 @@ jobs:
 
       # ---- SonarQube SAST Scan ----
       - name: SonarQube Scan
-        uses: SonarSource/sonarqube-scan-action@v2
-        if: secrets.SONAR_TOKEN != ''
         continue-on-error: true
+        uses: SonarSource/sonarqube-scan-action@v2
         with:
           projectBaseDir: ./app
           args: >
@@ -75,9 +74,6 @@ jobs:
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
           SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
-      - name: SonarQube — Skipped info
-        if: secrets.SONAR_TOKEN == ''
-        run: echo "⚠️ SonarQube skipped — set SONAR_TOKEN and SONAR_HOST_URL secrets"
 
       # ---- Build Docker Image ----
       - name: Build Docker image
@@ -87,8 +83,8 @@ jobs:
 
       # ---- Trivy Container Vulnerability Scan ----
       - name: Run Trivy vulnerability scanner
-        uses: aquasecurity/trivy-action@master
         continue-on-error: true
+        uses: aquasecurity/trivy-action@master
         with:
           image-ref: '${{ env.APP_NAME }}:${{ github.sha }}'
           format: 'sarif'
